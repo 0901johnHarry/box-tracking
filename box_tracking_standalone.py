@@ -11,7 +11,7 @@ from ultralytics import YOLO
 
 DEFAULT_MODEL = "best_26m.pt"
 DEFAULT_SOURCE = "record_20260211_104117.mkv"
-DEFAULT_ROI = (1436.0, 450.0, 4333.0, 1133.0)
+DEFAULT_ROI = (1436.0, 450.0, 3833.0, 1133.0)
 DEFAULT_CLASS_ID = 1
 DEFAULT_CROP_TO_ROI = True
 DEFAULT_CROP_PAD = 80
@@ -45,11 +45,12 @@ class BoxKalmanFilter:
         self.time_since_update = 0
         self.confirmed = False
         self.confidence = 1.0
-        self.history = []
+        self.history = [self._params_to_corners(cx, cy, w, h)]
         self.partial_offset = None
         self.is_partial = False
         self.matched_det_corners = None
         self.update_state = "TENTATIVE"
+        self.size_lock_state = "UNLOCKED"
         self.last_detection_area = w * h
         self.last_visible_ratio = 1.0
         self.last_center_offset_ratio = 0.0
@@ -58,6 +59,13 @@ class BoxKalmanFilter:
         self.reference_area = w * h
         self.last_frame_area = w * h
         self.area_locked = False
+        self.stable_w = max(float(w), 10.0)
+        self.stable_h = max(float(h), 10.0)
+        self.stable_area = self.stable_w * self.stable_h
+        self.stable_aspect = self.stable_w / max(self.stable_h, 1.0)
+        self.stable_update_alpha = 0.03
+        self.min_stable_update_visible_ratio = 0.90
+        self.max_stable_aspect_diff = 0.25
         self.display_smooth_factor = float(display_smooth_factor)
         self.smooth_corners = self._params_to_corners(cx, cy, w, h)
 
@@ -84,9 +92,82 @@ class BoxKalmanFilter:
 
     def lock_constraints(self):
         state = self.kf.statePost.ravel()
-        self.reference_area = max(state[2], 10) * max(state[3], 10)
+        self.stable_w = max(float(state[2]), 10.0)
+        self.stable_h = max(float(state[3]), 10.0)
+        self.stable_area = self.stable_w * self.stable_h
+        self.stable_aspect = self.stable_w / max(self.stable_h, 1.0)
+        self.reference_area = self.stable_area
         self.last_frame_area = self.reference_area
         self.area_locked = True
+        self.size_lock_state = "LOCKED"
+        self._force_state_stable_size()
+        state = self.kf.statePost.ravel()
+        self.smooth_corners = self._params_to_corners(state[0], state[1], self.stable_w, self.stable_h)
+
+    def ready_to_lock_stable_size(
+        self,
+        min_hits=8,
+        window=5,
+        max_total_growth_rate=0.08,
+        max_step_growth_rate=0.05,
+        max_aspect_jitter=0.12,
+        force_after_hits=24,
+    ):
+        if self.area_locked:
+            return True
+        if self.consecutive_hits < min_hits or len(self.history) < window:
+            self.size_lock_state = "ENTERING"
+            return False
+
+        recent = self.history[-window:]
+        params = [self._corners_to_params(corners) for corners in recent]
+        widths = np.array([max(p[2], 10.0) for p in params], dtype=np.float32)
+        heights = np.array([max(p[3], 10.0) for p in params], dtype=np.float32)
+        areas = widths * heights
+        aspects = widths / np.maximum(heights, 1.0)
+
+        total_growth = (areas[-1] - areas[0]) / (areas[0] + 1e-6)
+        step_growth = np.diff(areas) / (areas[:-1] + 1e-6)
+        max_step_growth = float(np.max(step_growth)) if len(step_growth) else 0.0
+        aspect_jitter = float((aspects.max() - aspects.min()) / (aspects.mean() + 1e-6))
+
+        still_growing = total_growth > max_total_growth_rate or max_step_growth > max_step_growth_rate
+        aspect_unstable = aspect_jitter > max_aspect_jitter
+        if still_growing or aspect_unstable:
+            self.size_lock_state = "ENTERING"
+            return self.consecutive_hits >= force_after_hits
+
+        self.size_lock_state = "READY"
+        return True
+
+    def _force_state_stable_size(self):
+        if not self.area_locked:
+            return
+        state = self.kf.statePost.ravel()
+        state[2] = self.stable_w
+        state[3] = self.stable_h
+        state[6] = 0.0
+        state[7] = 0.0
+        self.kf.statePost = state.reshape(-1, 1)
+
+    def _maybe_update_stable_size(self, measured_w, measured_h, visible_ratio):
+        if not self.area_locked:
+            return
+        measured_w = max(float(measured_w), 10.0)
+        measured_h = max(float(measured_h), 10.0)
+        measured_aspect = measured_w / max(measured_h, 1.0)
+        aspect_diff = abs(measured_aspect - self.stable_aspect) / max(self.stable_aspect, 1e-6)
+        if visible_ratio < self.min_stable_update_visible_ratio:
+            return
+        if aspect_diff > self.max_stable_aspect_diff:
+            return
+        alpha = self.stable_update_alpha
+        self.stable_w = self.stable_w * (1.0 - alpha) + measured_w * alpha
+        self.stable_h = self.stable_h * (1.0 - alpha) + measured_h * alpha
+        self.stable_area = self.stable_w * self.stable_h
+        self.stable_aspect = self.stable_w / max(self.stable_h, 1.0)
+        self.reference_area = self.stable_area
+        self.last_frame_area = self.stable_area
 
     def _clamp_state(self):
         if not self.area_locked:
@@ -117,6 +198,7 @@ class BoxKalmanFilter:
         self.age += 1
         self.time_since_update += 1
         self._clamp_state()
+        self._force_state_stable_size()
         self.matched_det_corners = None
         state = self.kf.statePost.ravel()
         return self._params_to_corners(state[0], state[1], max(state[2], 10), max(state[3], 10))
@@ -141,7 +223,7 @@ class BoxKalmanFilter:
         if center_offset_ratio is not None:
             self.last_center_offset_ratio = float(center_offset_ratio)
 
-    def soft_update(self, corners, detection_area=None, visible_ratio=None, center_offset_ratio=None):
+    def soft_update(self, corners, detection_area=None, visible_ratio=None, center_offset_ratio=None, update_stable_size=False):
         self._record_debug_metrics(
             corners,
             "FULL",
@@ -150,17 +232,21 @@ class BoxKalmanFilter:
             center_offset_ratio=center_offset_ratio,
         )
         cx, cy, w, h = self._corners_to_params(corners)
-        measurement = np.array([cx, cy, w, h], dtype=np.float32).reshape(-1, 1)
+        if self.area_locked and not update_stable_size:
+            measurement = np.array([cx, cy, self.stable_w, self.stable_h], dtype=np.float32).reshape(-1, 1)
+        else:
+            measurement = np.array([cx, cy, w, h], dtype=np.float32).reshape(-1, 1)
         self.kf.correct(measurement)
         self._clamp_state()
+        if update_stable_size:
+            self._maybe_update_stable_size(w, h, self.last_visible_ratio)
+        self._force_state_stable_size()
         self.time_since_update = 0
         self.hits += 1
         self.consecutive_hits += 1
         self.confidence = min(1.0, self.hits / (self.age + 1e-6))
         self.partial_offset = None
         self.is_partial = False
-        if self.area_locked:
-            self.reference_area = self.reference_area * 0.95 + self.get_area() * 0.05
         self._save_history()
         return self.get_state()
 
@@ -195,6 +281,7 @@ class BoxKalmanFilter:
         self.kf.correct(measurement)
         self.kf.measurementNoiseCov = original_r
         self._clamp_state()
+        self._force_state_stable_size()
         self.time_since_update = 0
         self.hits += 1
         self.consecutive_hits += 1
@@ -217,6 +304,9 @@ class BoxKalmanFilter:
 
     def get_raw_display_corners(self):
         kalman_corners = self.get_state()
+        if self.area_locked:
+            state = self.kf.statePost.ravel()
+            return self._params_to_corners(state[0], state[1], self.stable_w, self.stable_h)
         if self.matched_det_corners is None:
             return kalman_corners
         all_det_pts = np.vstack(self.matched_det_corners)
@@ -251,9 +341,13 @@ class BoxKalmanFilter:
 
     def get_params(self):
         state = self.kf.statePost.ravel()
+        if self.area_locked:
+            return {"cx": state[0], "cy": state[1], "w": self.stable_w, "h": self.stable_h, "vx": state[4], "vy": state[5]}
         return {"cx": state[0], "cy": state[1], "w": state[2], "h": state[3], "vx": state[4], "vy": state[5]}
 
     def get_area(self):
+        if self.area_locked:
+            return self.stable_area
         state = self.kf.statePost.ravel()
         return max(state[2], 10) * max(state[3], 10)
 
@@ -269,6 +363,9 @@ class BoxKalmanFilter:
         return {
             "area_vs_ref": self.get_area() / (self.reference_area + 1e-6),
             "ref_area": self.reference_area,
+            "stable_w": self.stable_w,
+            "stable_h": self.stable_h,
+            "stable_aspect": self.stable_aspect,
             "detection_area": self.last_detection_area,
             "visible_ratio": self.last_visible_ratio,
             "center_offset_ratio": self.last_center_offset_ratio,
@@ -329,6 +426,12 @@ class PredictionDrivenTracker:
         false_det_distance_ratio=1.5,
         max_area_change_rate=0.02,
         display_smooth_factor=0.4,
+        stable_lock_min_hits=8,
+        stable_lock_window=5,
+        stable_lock_max_total_growth_rate=0.08,
+        stable_lock_max_step_growth_rate=0.05,
+        stable_lock_max_aspect_jitter=0.12,
+        stable_lock_force_after_hits=24,
     ):
         self.max_age = int(max_age)
         self.confirm_frames = int(confirm_frames)
@@ -337,9 +440,28 @@ class PredictionDrivenTracker:
         self.false_det_distance_ratio = float(false_det_distance_ratio)
         self.max_area_change_rate = float(max_area_change_rate)
         self.display_smooth_factor = float(display_smooth_factor)
+        self.stable_lock_min_hits = int(stable_lock_min_hits)
+        self.stable_lock_window = int(stable_lock_window)
+        self.stable_lock_max_total_growth_rate = float(stable_lock_max_total_growth_rate)
+        self.stable_lock_max_step_growth_rate = float(stable_lock_max_step_growth_rate)
+        self.stable_lock_max_aspect_jitter = float(stable_lock_max_aspect_jitter)
+        self.stable_lock_force_after_hits = int(stable_lock_force_after_hits)
         self.trackers = []
         self.next_id = 1
         self.frame_count = 0
+
+    def _try_lock_stable_size(self, tracker):
+        if tracker.area_locked:
+            return
+        if tracker.ready_to_lock_stable_size(
+            min_hits=self.stable_lock_min_hits,
+            window=self.stable_lock_window,
+            max_total_growth_rate=self.stable_lock_max_total_growth_rate,
+            max_step_growth_rate=self.stable_lock_max_step_growth_rate,
+            max_aspect_jitter=self.stable_lock_max_aspect_jitter,
+            force_after_hits=self.stable_lock_force_after_hits,
+        ):
+            tracker.lock_constraints()
 
     @staticmethod
     def _corners_to_bbox_batch(corners_list):
@@ -414,7 +536,9 @@ class PredictionDrivenTracker:
                         detection_area=combined_area,
                         visible_ratio=area_ratio,
                         center_offset_ratio=center_offset_ratio,
+                        update_stable_size=area_ratio >= tracker.min_stable_update_visible_ratio,
                     )
+                    self._try_lock_stable_size(tracker)
                 elif area_ratio > self.area_ratio_partial:
                     tracker.partial_position_update(
                         combined,
@@ -450,7 +574,7 @@ class PredictionDrivenTracker:
                     matched_ti.add(ti)
                     if tracker.consecutive_hits >= self.confirm_frames:
                         tracker.confirmed = True
-                        tracker.lock_constraints()
+                        self._try_lock_stable_size(tracker)
             for ti, tracker in enumerate(unconfirmed):
                 if ti not in matched_ti:
                     tracker.mark_not_validated()
@@ -510,10 +634,19 @@ class PredictionDrivenTracker:
                     "is_partial": tracker.is_partial,
                     "constraints": tracker.get_constraint_info(),
                     "has_detection": tracker.matched_det_corners is not None,
+                    "id_source": "PredictionTracker",
                     "state": tracker.update_state,
                     "debug": {
                         "detection_area": tracker.last_detection_area,
                         "stable_area": tracker.reference_area if tracker.area_locked else tracker.get_area(),
+                        "stable_w": tracker.stable_w if tracker.area_locked else tracker.get_params()["w"],
+                        "stable_h": tracker.stable_h if tracker.area_locked else tracker.get_params()["h"],
+                        "stable_aspect": (
+                            tracker.stable_aspect
+                            if tracker.area_locked
+                            else tracker.get_params()["w"] / max(tracker.get_params()["h"], 1.0)
+                        ),
+                        "size_lock_state": tracker.size_lock_state,
                         "visible_ratio": tracker.last_visible_ratio,
                         "center_offset_ratio": tracker.last_center_offset_ratio,
                     },
@@ -675,9 +808,11 @@ class BoxTrackingSystem:
             center = corners.mean(axis=0).astype(np.int32)
             state = track.get("state") or ("DETECT" if track["has_detection"] else "PREDICT")
             lines = [
-                f"ID:{track_id} {state} det:{int(bool(track['has_detection']))} miss:{track['time_since_update']}",
+                f"ID:{track_id} {state} src:{track.get('id_source', 'PredictionTracker')}",
+                f"det:{int(bool(track['has_detection']))} miss:{track['time_since_update']}",
                 f"W:{params['w']:.0f} H:{params['h']:.0f} vis:{debug.get('visible_ratio', 0.0):.2f} off:{debug.get('center_offset_ratio', 0.0):.2f}",
                 f"detA:{debug.get('detection_area', 0.0):.0f} refA:{debug.get('stable_area', 0.0):.0f}",
+                f"stable:{debug.get('stable_w', params['w']):.0f}x{debug.get('stable_h', params['h']):.0f} lock:{debug.get('size_lock_state', 'NA')}",
             ]
             tx = max(0, min(center[0] - 120, w - 260))
             ty = max(58, center[1] - 34)
@@ -752,6 +887,7 @@ def main():
             fieldnames=[
                 "frame",
                 "track_id",
+                "id_source",
                 "state",
                 "has_detection",
                 "time_since_update",
@@ -761,6 +897,10 @@ def main():
                 "height",
                 "detection_area",
                 "stable_area",
+                "stable_width",
+                "stable_height",
+                "stable_aspect",
+                "size_lock_state",
                 "visible_ratio",
                 "center_offset_ratio",
             ],
@@ -786,6 +926,7 @@ def main():
                         {
                             "frame": frame_count,
                             "track_id": track["id"],
+                            "id_source": track.get("id_source", "PredictionTracker"),
                             "state": track.get("state"),
                             "has_detection": int(bool(track["has_detection"])),
                             "time_since_update": track["time_since_update"],
@@ -795,6 +936,10 @@ def main():
                             "height": float(params["h"]),
                             "detection_area": float(debug.get("detection_area", 0.0)),
                             "stable_area": float(debug.get("stable_area", 0.0)),
+                            "stable_width": float(debug.get("stable_w", params["w"])),
+                            "stable_height": float(debug.get("stable_h", params["h"])),
+                            "stable_aspect": float(debug.get("stable_aspect", 0.0)),
+                            "size_lock_state": debug.get("size_lock_state", "NA"),
                             "visible_ratio": float(debug.get("visible_ratio", 0.0)),
                             "center_offset_ratio": float(debug.get("center_offset_ratio", 0.0)),
                         }
@@ -803,7 +948,15 @@ def main():
             now = time.perf_counter()
             fps_text = 1.0 / max(now - last_ts, 1e-6)
             last_ts = now
-            cv2.putText(display_frame, f"FPS:{fps_text:.1f} Tracks:{len(tracks)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(
+                display_frame,
+                f"FPS:{fps_text:.1f} Tracks:{len(tracks)} ID:PredictionTracker",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+            )
 
             if args.output and writer is None:
                 h, w = display_frame.shape[:2]
